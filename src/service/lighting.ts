@@ -6,7 +6,7 @@ import { EventEmitter } from 'node:events'
 import { OpenRGBClient } from './openrgb/client.ts'
 import { DeviceType, isResizable, type Controller, type RGB, type Zone } from './openrgb/types.ts'
 import { WHITE_GROUPS, calibrationGains, driveLed, sanitizeCalibration, whiteGroupFor, type Gains } from '../shared/calibration.ts'
-import { EFFECT_BY_ID, isStaticScene, renderScene, renderStill, type LedSegment } from '../shared/effects.ts'
+import { isStaticScene, renderScene, renderStill, sanitizeScene, type LedSegment } from '../shared/effects.ts'
 import { BUILT_IN_PRESETS } from '../shared/presets.ts'
 import type {
   AppState, ConnectionState, FrameMap, LightInfo, LightKind, Prefs, Preset, Scene, SceneTarget, WhiteGroup
@@ -30,6 +30,9 @@ const SLOW_DEVICE_MS = 200
  * with the RAM now still (little bus traffic) dropouts should be rare, so this is a slow safety net.
  */
 const REARM_EVERY_MS = 10 * 60_000
+/** When a device doesn't answer while Lumen reads the device list, it tries again: first after this, then less often. */
+const SYNC_RETRY_MS = 1000
+const SYNC_RETRY_MAX_MS = 30_000
 
 /**
  * The RAM doesn't animate: at 2-3 updates a second, per-LED animation looked steppy, and one color through the
@@ -126,35 +129,22 @@ function classify(c: Controller, z: Zone): Classification {
   }
 }
 
-const HEX = /^#[0-9a-f]{6}$/i
-
-export function sanitizeScene(input: Scene): Scene {
-  const effect = EFFECT_BY_ID[input?.effect] ? input.effect : 'static'
-  const colors = Array.isArray(input?.colors) ? input.colors.filter((c) => typeof c === 'string' && HEX.test(c)).slice(0, 4) : []
-  const num = (v: unknown, d: number): number => (typeof v === 'number' && Number.isFinite(v) ? Math.max(0, Math.min(100, v)) : d)
-  const meta = EFFECT_BY_ID[effect]
-  const useDefaults = !colors.length && meta.colors.max > 0
-  const background = typeof input?.background === 'string' && HEX.test(input.background)
-    ? input.background
-    : useDefaults ? meta.background : undefined
-  return {
-    effect,
-    colors: useDefaults ? [...meta.colors.defaults] : colors,
-    speed: num(input?.speed, 45),
-    reverse: !!input?.reverse,
-    level: num(input?.level, 100),
-    ...(background ? { background } : {}),
-    ...(input?.bands === true ? { bands: true } : {})
-  }
-}
-
 export class LightingService extends EventEmitter<{ state: [AppState]; frame: [FrameMap]; log: [string] }> {
-  private readonly client = new OpenRGBClient({ name: 'Lumen' })
+  private readonly client: OpenRGBClient
   private readonly store: Store
   private connection: ConnectionState = 'connecting'
   private lights: RuntimeLight[] = []
   private devices: DeviceFrame[] = []
-  private lastInfos: LightInfo[] = []
+  /**
+   * Every light seen since Lumen started, so one whose device drops out of OpenRGB's list stays listed (offline)
+   * with its settings, instead of vanishing from the window.
+   */
+  private readonly seen = new Map<string, { info: LightInfo; order: number; controllerId: number }>()
+  /** Devices whose frames OpenRGB has stopped acknowledging (see OpenRGBClient.isResponding). */
+  private readonly notResponding = new Set<number>()
+  private syncRetryDelay = SYNC_RETRY_MS
+  /** Devices that didn't answer the last device-list read, to log each change once. */
+  private unanswered = ''
 
   private readonly t0 = performance.now()
   private lastTick = performance.now()
@@ -167,6 +157,8 @@ export class LightingService extends EventEmitter<{ state: [AppState]; frame: [F
   private scratchBuf = new Float32Array(0)
 
   private stopped = false
+  /** Counts connection attempts: an attempt that a newer one replaced (Reconnect pressed meanwhile) bows out quietly. */
+  private connectAttempt = 0
   private reconnectTimer?: NodeJS.Timeout
   private reconnectDelay = 1000
   private syncing = false
@@ -181,8 +173,11 @@ export class LightingService extends EventEmitter<{ state: [AppState]; frame: [F
   /** Devices whose next frame is sent with every lit value nudged by 1, to defeat OpenRGB's write cache. */
   private readonly flipNext = new Set<number>()
   private rearmBusy = false
+  /** Why the re-sync waiting in rearmTimer was asked for ('routine' = memory only; anything else includes the board). */
+  private rearmReason?: string
   private rearmTimer?: NodeJS.Timeout
   private rearmInterval?: NodeJS.Timeout
+  private readonly rearmEveryMs: number
   /** When Lumen last changed a controller's mode, to ignore OpenRGB's echo of it. */
   private readonly ownModeAt = new Map<number, number>()
 
@@ -191,13 +186,18 @@ export class LightingService extends EventEmitter<{ state: [AppState]; frame: [F
   /** Calibration gains per kind of hardware (from prefs.calibration). */
   private gains: Record<WhiteGroup, Gains>
 
-  constructor(store: Store) {
+  /**
+   * `client` defaults to OpenRGB on this PC; tests pass one connected to a fake server, and can shorten how often
+   * the memory is re-synced (`rearmEveryMs`).
+   */
+  constructor(store: Store, client: OpenRGBClient = new OpenRGBClient({ name: 'Lumen' }), opts: { rearmEveryMs?: number } = {}) {
     super()
     this.store = store
+    this.client = client
+    this.rearmEveryMs = opts.rearmEveryMs ?? REARM_EVERY_MS
     this.gains = gainsFor(store.data.prefs.calibration)
     this.client.on('disconnected', () => {
-      this.setConnection('offline')
-      this.devices = []
+      this.lostConnection()
       this.scheduleReconnect(1000)
     })
     this.client.on('deviceListUpdated', () => this.requestSync())
@@ -212,7 +212,7 @@ export class LightingService extends EventEmitter<{ state: [AppState]; frame: [F
     this.stopped = false
     void this.connect()
     this.tick()
-    this.rearmInterval = setInterval(() => this.scheduleRearm(0, 'routine'), REARM_EVERY_MS)
+    this.rearmInterval = setInterval(() => this.scheduleRearm(0, 'routine'), this.rearmEveryMs)
   }
 
   stop(): void {
@@ -222,6 +222,7 @@ export class LightingService extends EventEmitter<{ state: [AppState]; frame: [F
     clearTimeout(this.resyncTimer)
     clearTimeout(this.rearmTimer)
     clearTimeout(this.whiteTimer)
+    clearTimeout(this.stateTimer)
     clearInterval(this.rearmInterval)
     this.client.disconnect()
   }
@@ -232,19 +233,34 @@ export class LightingService extends EventEmitter<{ state: [AppState]; frame: [F
 
   private async connect(): Promise<void> {
     if (this.stopped) return
+    const attempt = ++this.connectAttempt
+    const current = (): boolean => attempt === this.connectAttempt && !this.stopped
     clearTimeout(this.reconnectTimer)
     this.setConnection('connecting')
     try {
       await this.client.connect()
+      if (!current()) return
       this.reconnectDelay = 1000
-      await this.sync()
+      const complete = await this.sync()
+      if (!current()) return
+      // OpenRGB can go away while the devices are read (a command then just fails): don't claim to be connected.
+      if (!this.client.connected) throw new Error('OpenRGB went away while Lumen read the devices')
       this.setConnection('connected')
       this.scheduleRearm(1500, 'connected')
+      if (!complete) this.retrySyncLater()
     } catch {
+      if (!current()) return // a newer attempt owns the connection now; closing it would undo that one
       this.client.disconnect()
-      this.setConnection('offline')
+      this.lostConnection()
       this.scheduleReconnect()
     }
+  }
+
+  /** OpenRGB is unreachable: every light shows as offline until Lumen is connected again. */
+  private lostConnection(): void {
+    this.setConnection('offline')
+    this.devices = []
+    this.notResponding.clear()
   }
 
   private scheduleReconnect(delay = this.reconnectDelay): void {
@@ -267,16 +283,31 @@ export class LightingService extends EventEmitter<{ state: [AppState]; frame: [F
     this.scheduleRearm(2000, 'refresh')
   }
 
+  /**
+   * Schedules a re-sync (see rearmSlowDevices). The 10-minute routine one (memory only) never replaces one that is
+   * already due, which also covers the memory and may include the motherboard; one due while another is running
+   * waits for it instead of being skipped.
+   */
   private scheduleRearm(delay: number, reason: string): void {
+    if (reason === 'routine' && this.rearmReason !== undefined) return
     clearTimeout(this.rearmTimer)
-    this.rearmTimer = setTimeout(() => {
-      const withBoard = reason !== 'routine'
-      this.rearmSlowDevices(withBoard)
-        .then((n) => {
-          if (n && withBoard) this.emit('log', `Re-synced memory and motherboard lighting (${reason}).`)
-        })
-        .catch((err: unknown) => this.emit('log', `Lighting re-sync failed (${reason}): ${String(err)}`))
-    }, delay)
+    this.rearmReason = reason
+    this.rearmTimer = setTimeout(() => this.runRearm(), delay)
+  }
+
+  private runRearm(): void {
+    if (this.rearmBusy) {
+      this.rearmTimer = setTimeout(() => this.runRearm(), 500)
+      return
+    }
+    const reason = this.rearmReason ?? 'routine'
+    this.rearmReason = undefined
+    const withBoard = reason !== 'routine'
+    this.rearmSlowDevices(withBoard)
+      .then((n) => {
+        if (n && withBoard) this.emit('log', `Re-synced memory and motherboard lighting (${reason}).`)
+      })
+      .catch((err: unknown) => this.emit('log', `Lighting re-sync failed (${reason}): ${String(err)}`))
   }
 
   /**
@@ -358,20 +389,54 @@ export class LightingService extends EventEmitter<{ state: [AppState]; frame: [F
     return { r: Math.round(r / n), g: Math.round(g / n), b: Math.round(b / n) }
   }
 
-  private requestSync(): void {
+  private requestSync(delay = 400): void {
     clearTimeout(this.resyncTimer)
-    this.resyncTimer = setTimeout(() => void this.sync().catch(() => {}), 400)
+    this.resyncTimer = setTimeout(() => void this.syncOrRetry(), delay)
   }
 
-  private async sync(): Promise<void> {
-    if (!this.client.connected) return
+  /** Syncs, and tries again later if OpenRGB didn't give the whole picture. */
+  private async syncOrRetry(): Promise<void> {
+    const complete = await this.sync().catch(() => false)
+    if (!complete) this.retrySyncLater()
+  }
+
+  /** Another sync after a growing delay: a device that didn't answer may have recovered, or left the list. */
+  private retrySyncLater(): void {
+    if (this.stopped || !this.client.connected) return
+    this.requestSync(this.syncRetryDelay)
+    this.syncRetryDelay = Math.min(this.syncRetryDelay * 2, SYNC_RETRY_MAX_MS)
+  }
+
+  /**
+   * Reads every controller. One that doesn't answer (OpenRGB's worker for it is stuck, or the device left the
+   * list between the count and the read) doesn't hold up the rest: it keeps its last known details if it has
+   * any, and `missing` lists it.
+   */
+  private async readControllers(): Promise<{ controllers: Controller[]; missing: number[] }> {
+    const ids = await this.client.controllerIds()
+    const results = await Promise.allSettled(ids.map((id) => this.client.controller(id)))
+    if (!this.client.connected) throw new Error('OpenRGB disconnected while Lumen read the devices')
+    const controllers: Controller[] = []
+    const missing: number[] = []
+    results.forEach((r, i) => {
+      if (r.status === 'fulfilled') return void controllers.push(r.value)
+      missing.push(ids[i])
+      const known = this.ctrls.get(ids[i])
+      if (known) controllers.push(known)
+    })
+    return { controllers, missing }
+  }
+
+  /** Reads the devices and gets them ready. Resolves false if a device didn't answer, so a retry is due. */
+  private async sync(): Promise<boolean> {
+    if (!this.client.connected) return true // the reconnect syncs
     if (this.syncing) {
       this.syncQueued = true
-      return
+      return true
     }
     this.syncing = true
     try {
-      let controllers = await this.client.controllers()
+      let { controllers, missing } = await this.readControllers()
 
       // Apply the LED counts we want on resizable zones (ARGB headers).
       let resized = false
@@ -384,7 +449,7 @@ export class LightingService extends EventEmitter<{ state: [AppState]; frame: [F
           }
         }
       }
-      if (resized) controllers = await this.client.controllers()
+      if (resized) ({ controllers, missing } = await this.readControllers())
 
       // Software control needs each device in its Direct/custom mode.
       for (const c of controllers) {
@@ -397,11 +462,20 @@ export class LightingService extends EventEmitter<{ state: [AppState]; frame: [F
       }
 
       this.rebuild(controllers)
+
+      const unanswered = missing.join(',')
+      if (unanswered !== this.unanswered) {
+        this.unanswered = unanswered
+        const names = missing.map((id) => this.ctrls.get(id)?.name ?? `#${id}`).join(', ')
+        if (missing.length) this.emit('log', `No answer from ${names} while reading the devices; Lumen will keep trying.`)
+      }
+      if (!missing.length) this.syncRetryDelay = SYNC_RETRY_MS
+      return missing.length === 0
     } finally {
       this.syncing = false
       if (this.syncQueued) {
         this.syncQueued = false
-        void this.sync().catch(() => {})
+        void this.syncOrRetry()
       }
     }
   }
@@ -444,6 +518,7 @@ export class LightingService extends EventEmitter<{ state: [AppState]; frame: [F
     lights.sort((a, b) => a.cls.order - b.cls.order)
     this.lights = lights
     this.devices = devices
+    for (const id of this.notResponding) if (!this.ctrls.has(id)) this.notResponding.delete(id)
     this.emitState()
     this.kick()
   }
@@ -568,6 +643,7 @@ export class LightingService extends EventEmitter<{ state: [AppState]; frame: [F
           d.lastSent = now
         }
       }
+      this.checkResponding()
     }
 
     if (this.previewOn && now - this.lastPreview >= PREVIEW_INTERVAL_MS) {
@@ -579,6 +655,26 @@ export class LightingService extends EventEmitter<{ state: [AppState]; frame: [F
     const frameMs = 1000 / data.prefs.fps
     const delay = animating ? Math.max(4, frameMs - (performance.now() - now)) : 250
     this.timer = setTimeout(this.tick, delay)
+  }
+
+  /**
+   * Marks devices whose frames OpenRGB has stopped acknowledging, so the window shows them as not responding.
+   * Their newest frame is still delivered once they recover (the client keeps it waiting).
+   */
+  private checkResponding(): void {
+    for (const d of this.devices) {
+      const responding = this.client.isResponding(d.id)
+      if (responding !== this.notResponding.has(d.id)) continue
+      const name = d.lights[0]?.deviceName ?? `Device ${d.id}`
+      if (responding) {
+        this.notResponding.delete(d.id)
+        this.emit('log', `${name} is responding again.`)
+      } else {
+        this.notResponding.add(d.id)
+        this.emit('log', `${name} isn't responding: OpenRGB hasn't confirmed its lighting updates.`)
+      }
+      this.emitState()
+    }
   }
 
   private previewFrame(): FrameMap {
@@ -610,30 +706,49 @@ export class LightingService extends EventEmitter<{ state: [AppState]; frame: [F
     this.emitState()
   }
 
+  /**
+   * The lights as the window shows them. A light is online only while OpenRGB is connected, its device is in
+   * OpenRGB's list and the device acknowledges its updates. Lights whose device left the list stay listed.
+   */
   private lightInfos(): LightInfo[] {
-    if (!this.lights.length) return this.lastInfos.map((l) => ({ ...l, online: false }))
-    const infos = this.lights.map((l): LightInfo => {
-      const stored = this.store.light(l.key)
-      return {
-        key: l.key,
-        name: stored.name || l.cls.defaultName,
-        defaultName: l.cls.defaultName,
-        kind: l.cls.kind,
-        group: l.cls.group,
-        groupName: l.cls.groupName,
-        deviceName: l.deviceName,
-        zoneName: l.zone.name,
-        ledCount: l.count,
-        ringLeds: stored.ring,
-        resizable: isResizable(l.zone),
-        maxLeds: l.zone.ledsMax,
-        hidden: !!stored.hidden,
-        online: this.connection === 'connected',
-        scene: stored.scene ?? null
-      }
-    })
-    this.lastInfos = infos
-    return infos
+    const present = new Set<string>()
+    for (const l of this.lights) {
+      present.add(l.key)
+      this.seen.set(l.key, {
+        order: l.cls.order,
+        controllerId: l.controllerId,
+        info: {
+          key: l.key,
+          name: l.cls.defaultName,
+          defaultName: l.cls.defaultName,
+          kind: l.cls.kind,
+          group: l.cls.group,
+          groupName: l.cls.groupName,
+          deviceName: l.deviceName,
+          zoneName: l.zone.name,
+          ledCount: l.count,
+          resizable: isResizable(l.zone),
+          maxLeds: l.zone.ledsMax,
+          hidden: false,
+          online: false,
+          scene: null
+        }
+      })
+    }
+    const connected = this.connection === 'connected'
+    return [...this.seen.values()]
+      .sort((a, b) => a.order - b.order)
+      .map(({ info, controllerId }): LightInfo => {
+        const stored = this.store.light(info.key)
+        return {
+          ...info,
+          name: stored.name || info.defaultName,
+          ringLeds: stored.ring,
+          hidden: !!stored.hidden,
+          online: connected && present.has(info.key) && !this.notResponding.has(controllerId),
+          scene: stored.scene ?? null
+        }
+      })
   }
 
   getState(): AppState {
@@ -686,6 +801,7 @@ export class LightingService extends EventEmitter<{ state: [AppState]; frame: [F
   }
 
   setBrightness(value: number): void {
+    if (!Number.isFinite(value)) return // NaN would leave every light dark until Lumen restarts
     this.store.data.brightness = Math.max(1, Math.min(100, Math.round(value)))
     this.store.save()
     this.emitState()
@@ -706,7 +822,8 @@ export class LightingService extends EventEmitter<{ state: [AppState]; frame: [F
 
   async setLedCount(key: string, count: number): Promise<void> {
     const light = this.lights.find((l) => l.key === key)
-    if (!light || !isResizable(light.zone)) return
+    // Not a number: OpenRGB would get 0, which turns off every fan and the strip on the shared header.
+    if (!light || !isResizable(light.zone) || !Number.isFinite(count)) return
     const n = Math.max(light.zone.ledsMin, Math.min(light.zone.ledsMax, Math.round(count)))
     this.store.updateLight(key, { ledCount: n })
     await this.client.resizeZone(light.controllerId, light.zone.index, n)
@@ -716,7 +833,7 @@ export class LightingService extends EventEmitter<{ state: [AppState]; frame: [F
   /** LEDs per fan ring on a mirrored connector (0 = no ring, the whole zone is one run). */
   setRingLeds(key: string, ring: number): void {
     const light = this.lights.find((l) => l.key === key)
-    if (!light) return
+    if (!light || !Number.isFinite(ring)) return // not a number would silently remove the fan ring
     const n = Math.max(0, Math.min(light.count, Math.round(ring)))
     this.store.updateLight(key, { ring: n || undefined })
     this.beginFade([light])

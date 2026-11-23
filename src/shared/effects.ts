@@ -58,6 +58,33 @@ export function withEffect(scene: Scene, effect: EffectId): Scene {
   return next
 }
 
+const HEX = /^#[0-9a-f]{6}$/i
+
+/**
+ * A valid scene from untrusted input (the window, or a settings file): unknown effects become Solid, colors must
+ * be '#rrggbb' (at most 4), numbers are clamped to 0..100, and an effect with no usable colors gets its own
+ * default look. A valid scene comes back unchanged.
+ */
+export function sanitizeScene(input: Scene): Scene {
+  const effect = EFFECT_BY_ID[input?.effect] ? input.effect : 'static'
+  const colors = Array.isArray(input?.colors) ? input.colors.filter((c) => typeof c === 'string' && HEX.test(c)).slice(0, 4) : []
+  const num = (v: unknown, d: number): number => (typeof v === 'number' && Number.isFinite(v) ? Math.max(0, Math.min(100, v)) : d)
+  const meta = EFFECT_BY_ID[effect]
+  const useDefaults = !colors.length && meta.colors.max > 0
+  const background = typeof input?.background === 'string' && HEX.test(input.background)
+    ? input.background
+    : useDefaults ? meta.background : undefined
+  return {
+    effect,
+    colors: useDefaults ? [...meta.colors.defaults] : colors,
+    speed: num(input?.speed, 45),
+    reverse: !!input?.reverse,
+    level: num(input?.level, 100),
+    ...(background ? { background } : {}),
+    ...(input?.bands === true ? { bands: true } : {})
+  }
+}
+
 /** The colors an effect actually uses: the first `max` of the scene's colors (scenes may keep more for later). */
 export function effectColors(scene: Scene): string[] {
   const max = EFFECT_BY_ID[scene.effect]?.colors.max ?? 4

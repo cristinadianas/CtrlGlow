@@ -30,6 +30,7 @@ export function GroupPage({ state, group }: { state: AppState; group: LightGroup
   const editing = targets.find((l) => l.scene)?.scene ?? state.scene
   const leds = group.lights.reduce((n, l) => n + l.ledCount, 0)
   const single = group.lights.length === 1 ? group.lights[0] : sel !== 'all' ? targets[0] : null
+  const notResponding = state.connection === 'connected' && group.lights.some((l) => !l.online)
 
   const [name, setName] = useState(single?.name ?? '')
   useEffect(() => setName(single?.name ?? ''), [single?.key, single?.name])
@@ -39,7 +40,10 @@ export function GroupPage({ state, group }: { state: AppState; group: LightGroup
       <div className="page-title-row">
         <div>
           <h1 className="page-title">{group.name}</h1>
-          <p className="page-subtitle">{group.lights[0]?.deviceName} · {leds} {leds === 1 ? 'LED' : 'LEDs'}</p>
+          <p className="page-subtitle">
+            {group.lights[0]?.deviceName} · {leds} {leds === 1 ? 'LED' : 'LEDs'}
+            {notResponding && <span style={{ color: 'var(--orange)' }}> · Not responding (changes apply when it&apos;s back)</span>}
+          </p>
         </div>
         <button type="button" className="btn" onClick={() => void api.identify(keys)} title="Flashes this device so you can spot it in your PC">
           <FlashIcon size={14} /> Flash to Find

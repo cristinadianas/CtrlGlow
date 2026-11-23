@@ -41,7 +41,7 @@ export function HomePage({ state, groups, onNavigate }: {
             <div className="hero-blurb">{preset ? `${meta.name} · ${meta.blurb}` : meta.blurb}</div>
             {customCount > 0 && (
               <div className="hero-blurb" style={{ marginTop: 8 }}>
-                {customCount === 1 ? '1 device has' : `${customCount} devices have`} its own look.
+                {customCount === 1 ? '1 device has its own look.' : `${customCount} devices have their own look.`}
               </div>
             )}
           </div>
@@ -90,7 +90,10 @@ export function HomePage({ state, groups, onNavigate }: {
       <div className="device-grid">
         {groups.map((g) => {
           const custom = g.lights.filter((l) => l.scene)
-          const sub = custom.length === 0
+          // Offline while OpenRGB is connected: the device left OpenRGB's list or stopped confirming updates.
+          const sub = state.connection === 'connected' && g.lights.some((l) => !l.online)
+            ? 'Not responding'
+            : custom.length === 0
             ? 'Matching All Lights'
             : custom.length === g.lights.length && g.lights.every((l) => l.scene?.effect === custom[0].scene?.effect)
               ? `Own look · ${EFFECT_BY_ID[custom[0].scene!.effect].name}`

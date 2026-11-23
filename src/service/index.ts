@@ -15,6 +15,7 @@ import { join, resolve } from 'node:path'
 import { LightingService } from './lighting.ts'
 import { APP_URL, PORT, isLumenRunning, startServer, type Actions, type LumenServer } from './server.ts'
 import { Store } from './store.ts'
+import { applyLaunchAtLogin } from './sign-in.ts'
 import { openAppWindow, setLaunchAtLogin, startTray, startupShortcutPath } from './windows.ts'
 import type { Prefs, Scene, SceneTarget } from '../shared/types.ts'
 
@@ -49,7 +50,8 @@ if (await isLumenRunning()) {
 
 if (!existsSync(join(uiRoot, 'index.html'))) log('UI not built yet; run "npm run build". The lighting engine still runs.')
 
-const store = new Store(join(dataDir, 'settings.json'))
+const store = new Store(join(dataDir, 'settings.json'), { report: log })
+for (const problem of store.problems) log(problem)
 const lighting = new LightingService(store)
 let server: LumenServer | null = null
 let tray: ChildProcess | null = null
@@ -68,12 +70,13 @@ async function shutdown(code = 0): Promise<void> {
   process.exit(code)
 }
 
+/** Adds or removes the sign-in shortcut; if that fails, the setting is put back to what is really in place. */
 function syncLaunchAtLogin(prefs: Prefs): void {
-  const has = existsSync(startupShortcutPath())
-  if (prefs.launchAtLogin !== has) {
-    const ok = setLaunchAtLogin(prefs.launchAtLogin, entry, projectRoot, appIcon)
-    log(`${prefs.launchAtLogin ? 'Added' : 'Removed'} sign-in shortcut: ${ok ? 'ok' : 'FAILED'}`)
-  }
+  const actual = applyLaunchAtLogin(prefs.launchAtLogin, {
+    exists: () => existsSync(startupShortcutPath()),
+    set: (on) => setLaunchAtLogin(on, entry, projectRoot, appIcon)
+  }, log)
+  if (actual !== prefs.launchAtLogin) lighting.setPrefs({ launchAtLogin: actual })
 }
 
 function isTarget(t: unknown): t is SceneTarget {

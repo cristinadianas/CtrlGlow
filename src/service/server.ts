@@ -9,14 +9,13 @@
  */
 import http from 'node:http'
 import { readFile } from 'node:fs/promises'
+import type { AddressInfo } from 'node:net'
 import { extname, resolve, sep } from 'node:path'
 
 export const PORT = 6743
 export const APP_URL = `http://127.0.0.1:${PORT}/`
 
-const ALLOWED_HOSTS = new Set([`127.0.0.1:${PORT}`, `localhost:${PORT}`])
-const ALLOWED_ORIGINS = new Set([`http://127.0.0.1:${PORT}`, `http://localhost:${PORT}`])
-const MAX_BODY = 256 * 1024
+export const MAX_BODY = 256 * 1024
 
 const MIME: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
@@ -44,6 +43,8 @@ export type Actions = Record<string, (...args: unknown[]) => unknown>
 export interface LumenServer {
   broadcast(event: 'state' | 'frame', data: unknown): void
   readonly clientCount: number
+  /** The port it listens on (127.0.0.1). */
+  readonly port: number
   close(): Promise<void>
 }
 
@@ -53,9 +54,14 @@ export function startServer(opts: {
   initialState: () => unknown
   onClientsChanged: (count: number) => void
   log: (msg: string) => void
+  /** Defaults to PORT; 0 picks a free port (used by the tests). */
+  port?: number
 }): Promise<LumenServer> {
   const uiRoot = resolve(opts.uiRoot)
   const clients = new Set<http.ServerResponse>()
+  // Set once listening, from the actual port.
+  let allowedHosts = new Set<string>()
+  let allowedOrigins = new Set<string>()
 
   const server = http.createServer((req, res) => {
     void handle(req, res).catch((err: unknown) => {
@@ -66,9 +72,9 @@ export function startServer(opts: {
   })
 
   async function handle(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
-    if (!ALLOWED_HOSTS.has(req.headers.host ?? '')) return deny(res, 403)
+    if (!allowedHosts.has(req.headers.host ?? '')) return deny(res, 403)
     const origin = req.headers.origin
-    if (origin !== undefined && !ALLOWED_ORIGINS.has(origin)) return deny(res, 403)
+    if (origin !== undefined && !allowedOrigins.has(origin)) return deny(res, 403)
 
     const url = new URL(req.url ?? '/', `http://${req.headers.host}`)
     const path = url.pathname
@@ -140,9 +146,13 @@ export function startServer(opts: {
 
   return new Promise((resolvePromise, reject) => {
     server.once('error', reject)
-    server.listen(PORT, '127.0.0.1', () => {
+    server.listen(opts.port ?? PORT, '127.0.0.1', () => {
       server.off('error', reject)
+      const port = (server.address() as AddressInfo).port
+      allowedHosts = new Set([`127.0.0.1:${port}`, `localhost:${port}`])
+      allowedOrigins = new Set([`http://127.0.0.1:${port}`, `http://localhost:${port}`])
       resolvePromise({
+        port,
         broadcast(event, data) {
           if (!clients.size) return
           const msg = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`

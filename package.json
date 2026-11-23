@@ -10,6 +10,9 @@
     "start": "node src/service/index.ts --open",
     "service": "node src/service/index.ts",
     "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "node --test --test-timeout=60000 --test-force-exit \"test/**/*.test.ts\"",
+    "test:coverage": "node --test --test-timeout=60000 --test-force-exit --experimental-test-coverage --test-coverage-include=\"src/**\" --test-coverage-exclude=\"src/renderer/**\" --test-coverage-exclude=\"src/service/index.ts\" --test-coverage-exclude=\"src/service/windows.ts\" --test-coverage-lines=85 --test-coverage-branches=80 --test-coverage-functions=75 \"test/**/*.test.ts\"",
+    "check": "npm run typecheck && npm run test:coverage && npm run build",
     "setup": "npm run build && powershell -NoProfile -ExecutionPolicy Bypass -File scripts/install.ps1",
     "devices": "node tools/list-devices.mts"
   },

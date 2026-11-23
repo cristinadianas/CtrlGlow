@@ -10,16 +10,11 @@
 import { EventEmitter } from 'node:events'
 import net from 'node:net'
 import {
-  CLIENT_PROTOCOL_VERSION, HEADER_SIZE, MAGIC, PacketId,
+  CLIENT_PROTOCOL_VERSION, ClientFlag, HEADER_SIZE, MAGIC, PacketId, ServerFlag,
   encodeClientName, encodeHeader, encodeResizeZone, encodeU32, encodeUpdateLeds,
   encodeUpdateLedsPacked, encodeUpdateMode, encodeUpdateZoneLeds, encodeUpdateZoneMode, parseController
 } from './protocol.ts'
 import type { Controller, Mode, RGB } from './types.ts'
-
-/** Client/server flags (protocol 6). */
-const CLIENT_FLAG_SUPPORTS_RGBCONTROLLER = 1 << 0
-const CLIENT_FLAG_REQUEST_LOCAL_CLIENT = 1 << 16
-const SERVER_FLAG_LOCAL_CLIENT = 1 << 16
 
 /** A NUL-terminated UTF-8 string, as OpenRGB expects for names, keys and JSON. */
 const cString = (s: string): Buffer => Buffer.concat([Buffer.from(s, 'utf8'), Buffer.alloc(1)])
@@ -39,10 +34,22 @@ interface Waiter {
 }
 
 interface FrameSlot {
-  busy: boolean
+  /** Frames sent to the device and not acknowledged yet. */
+  inFlight: number
   sentAt: number
+  /** When the device last acknowledged a frame, or had none waiting. */
+  heardAt: number
   pending?: { pktId: number; payload: Buffer }
 }
+
+/** A frame that has waited this long for its acknowledgement is treated as lost, so the animation doesn't stall. */
+const LOST_FRAME_MS = 500
+/**
+ * At most this many frames wait in OpenRGB for one device. OpenRGB applies each device's updates in order and
+ * acknowledges each one only after applying it, so a device that has stopped responding would otherwise collect
+ * a growing backlog of old frames and replay them all once it recovers.
+ */
+const MAX_FRAMES_IN_FLIGHT = 3
 
 export interface OpenRGBClientEvents {
   connected: []
@@ -84,33 +91,53 @@ export class OpenRGBClient extends EventEmitter<OpenRGBClientEvents> {
   /* Connection                                                       */
   /* ---------------------------------------------------------------- */
 
+  /**
+   * Opens a new connection, replacing the current one. Every handler is tied to its own socket: a socket that was
+   * let go of (disconnect(), or a newer connect()) can still close a moment later, and must not take the new
+   * connection down with it.
+   */
   async connect(): Promise<void> {
     if (this.socket) this.disconnect()
     const socket = net.connect({ host: this.host, port: this.port })
     socket.setNoDelay(true)
+    socket.on('error', () => { /* surfaced through 'close', or by the connect promise below */ })
     this.socket = socket
     this.rx = Buffer.alloc(0)
+    const stillCurrent = (): void => {
+      if (this.socket !== socket) throw new Error('The connection to OpenRGB was closed or replaced')
+    }
 
-    await new Promise<void>((resolve, reject) => {
-      const onError = (err: Error): void => {
-        socket.off('connect', onConnect)
-        reject(err)
-      }
-      const onConnect = (): void => {
-        socket.off('error', onError)
-        resolve()
-      }
-      socket.once('error', onError)
-      socket.once('connect', onConnect)
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const settle = (err?: Error): void => {
+          socket.off('connect', onConnect)
+          socket.off('error', onError)
+          socket.off('close', onClose)
+          if (err) reject(err)
+          else resolve()
+        }
+        const onConnect = (): void => settle()
+        const onError = (err: Error): void => settle(err)
+        const onClose = (): void => settle(new Error('The connection to OpenRGB was closed')) // destroyed while connecting
+        socket.once('connect', onConnect)
+        socket.once('error', onError)
+        socket.once('close', onClose)
+      })
+    } catch (err) {
+      if (this.socket === socket) this.socket = undefined
+      throw err
+    }
+    stillCurrent()
+
+    socket.on('data', (chunk: Buffer) => {
+      if (this.socket === socket) this.onData(chunk)
     })
-
-    socket.on('data', (chunk: Buffer) => this.onData(chunk))
-    socket.on('error', () => { /* surfaced through 'close' */ })
-    socket.on('close', () => this.onClose())
+    socket.on('close', () => this.onClose(socket))
 
     // Negotiate protocol version (min of ours and the server's).
     const reply = await this.request(0, PacketId.REQUEST_PROTOCOL_VERSION, encodeU32(CLIENT_PROTOCOL_VERSION), 2000)
       .catch(() => null)
+    stillCurrent() // a disconnect() or newer connect() meanwhile owns the client now: leave it alone
     const serverVersion = reply && reply.length >= 4 ? reply.readUInt32LE(0) : 0
     this.protocol = Math.min(CLIENT_PROTOCOL_VERSION, serverVersion)
     if (this.protocol < 1) {
@@ -121,14 +148,21 @@ export class OpenRGBClient extends EventEmitter<OpenRGBClientEvents> {
     this.emit('connected')
   }
 
+  /**
+   * Closes the connection on purpose. That emits no "disconnected" (the caller knows), and `connected` stays false
+   * until the next connect() has finished its handshake.
+   */
   disconnect(): void {
     const s = this.socket
     this.socket = undefined
+    this.protocol = 0
     if (s && !s.destroyed) s.destroy()
     this.failAll(new Error('Disconnected'))
   }
 
-  private onClose(): void {
+  /** The server closed the connection (or it broke). Ignored for a socket that was already let go of. */
+  private onClose(socket: net.Socket): void {
+    if (this.socket !== socket) return
     const wasConnected = this.protocol > 0
     this.socket = undefined
     this.protocol = 0
@@ -170,6 +204,7 @@ export class OpenRGBClient extends EventEmitter<OpenRGBClientEvents> {
   private dispatch(devId: number, pktId: number, payload: Buffer): void {
     switch (pktId) {
       case PacketId.ACK: {
+        if (payload.length < 8) return // malformed: treated like a lost acknowledgement (reading it would throw and stop Lumen)
         const ackedPkt = payload.readUInt32LE(0)
         const status = payload.readUInt32LE(4)
         const list = this.acks.get(`${ackedPkt}:${devId}`)
@@ -300,9 +335,9 @@ export class OpenRGBClient extends EventEmitter<OpenRGBClientEvents> {
    * for this client to acknowledge every profile load. Resolves true if granted.
    */
   async requestLocalClient(): Promise<boolean> {
-    const flags = CLIENT_FLAG_SUPPORTS_RGBCONTROLLER | CLIENT_FLAG_REQUEST_LOCAL_CLIENT
+    const flags = ClientFlag.SUPPORTS_RGBCONTROLLER | ClientFlag.REQUEST_LOCAL_CLIENT
     const reply = await this.requestReply(0, PacketId.SET_CLIENT_FLAGS, PacketId.SET_SERVER_FLAGS, encodeU32(flags))
-    return reply.length >= 4 && (reply.readUInt32LE(0) & SERVER_FLAG_LOCAL_CLIENT) !== 0
+    return reply.length >= 4 && (reply.readUInt32LE(0) & ServerFlag.LOCAL_CLIENT) !== 0
   }
 
   /** Saves the devices' current state as a server profile. Resolves with the status (0 = OK) once saved. */
@@ -401,14 +436,23 @@ export class OpenRGBClient extends EventEmitter<OpenRGBClientEvents> {
     return this.command(id, PacketId.UPDATE_LEDS, encodeUpdateLeds(colors))
   }
 
+  /**
+   * False once a device has gone the request timeout without acknowledging any of the frames waiting for it,
+   * which means OpenRGB's worker for that device is stuck. True again with its next acknowledgement.
+   */
+  isResponding(id: number): boolean {
+    const slot = this.frames.get(id)
+    return !slot || slot.inFlight === 0 || Date.now() - slot.heardAt < this.timeoutMs
+  }
+
   private sendFrame(id: number, pktId: number, payload: Buffer): void {
     let slot = this.frames.get(id)
     if (!slot) {
-      slot = { busy: false, sentAt: 0 }
+      slot = { inFlight: 0, sentAt: 0, heardAt: Date.now() }
       this.frames.set(id, slot)
     }
-    // A frame that has waited >500 ms for its ACK is considered lost; don't stall forever.
-    if (slot.busy && Date.now() - slot.sentAt < 500) {
+    // Wait for the previous frame's acknowledgement, unless it seems lost; never queue more than a few.
+    if (slot.inFlight > 0 && (Date.now() - slot.sentAt < LOST_FRAME_MS || slot.inFlight >= MAX_FRAMES_IN_FLIGHT)) {
       slot.pending = { pktId, payload }
       return
     }
@@ -420,14 +464,16 @@ export class OpenRGBClient extends EventEmitter<OpenRGBClientEvents> {
       this.send(id, pktId, payload)
       return
     }
-    slot.busy = true
+    if (slot.inFlight === 0) slot.heardAt = Date.now()
+    slot.inFlight++
     slot.sentAt = Date.now()
     slot.pending = undefined
     const ok = this.send(id, pktId, payload, () => {
-      slot.busy = false
+      slot.inFlight = Math.max(0, slot.inFlight - 1)
+      slot.heardAt = Date.now()
       const next = slot.pending
       if (next) this.transmitFrame(id, slot, next.pktId, next.payload)
     })
-    if (!ok) slot.busy = false
+    if (!ok) slot.inFlight--
   }
 }

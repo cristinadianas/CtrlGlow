@@ -41,7 +41,13 @@ export const PacketId = {
 
 export const ClientFlag = {
   SUPPORTS_RGBCONTROLLER: 1 << 0,
+  SUPPORTS_PROFILEMANAGER: 1 << 2,
   REQUEST_LOCAL_CLIENT: 1 << 16
+} as const
+
+export const ServerFlag = {
+  /** Confirms the client was granted local-client rights (profiles, settings). */
+  LOCAL_CLIENT: 1 << 16
 } as const
 
 export function encodeHeader(devId: number, pktId: number, size: number): Buffer {

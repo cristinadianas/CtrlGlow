@@ -49,6 +49,10 @@ export interface LightInfo {
   resizable: boolean
   maxLeds: number
   hidden: boolean
+  /**
+   * False while OpenRGB is unreachable, while the light's device is missing from OpenRGB's list (it stays listed
+   * with its settings), or while the device has stopped confirming its updates.
+   */
   online: boolean
   /** Own scene; null means it follows "All Lights". */
   scene: Scene | null

@@ -17,5 +17,5 @@
     "noFallthroughCasesInSwitch": true,
     "types": ["node"]
   },
-  "include": ["src", "tools", "vite.config.ts"]
+  "include": ["src", "tools", "test", "vite.config.ts"]
 }
