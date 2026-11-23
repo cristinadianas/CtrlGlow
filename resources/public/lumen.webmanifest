@@ -1,0 +1,13 @@
+{
+  "name": "Lumen",
+  "short_name": "Lumen",
+  "description": "Lighting control for my PC",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#f7f7f9",
+  "theme_color": "#ebebef",
+  "icons": [
+    { "src": "/icon.png", "sizes": "512x512", "type": "image/png", "purpose": "any" }
+  ]
+}
